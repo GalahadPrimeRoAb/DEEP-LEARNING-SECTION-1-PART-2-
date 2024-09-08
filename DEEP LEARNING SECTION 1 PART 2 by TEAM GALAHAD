@@ -1,0 +1,338 @@
+!nvidia-smi
+!pip install -U datasets
+%%capture
+!pip install transformers==4.19.2
+!pip install rouge_score
+from datasets import load_metric
+import pandas as pd
+
+# Load the CSV file from Google Drive
+df = pd.read_csv("/content/drive/MyDrive/codecycle/wikiHow.csv")
+
+# Display the first few rows of the dataframe
+df.head()
+print(df.shape)
+df = df.dropna()
+print(df.shape)
+print(df.shape)
+df = df.drop_duplicates()
+print(df.shape)
+from matplotlib import pyplot as plt
+
+# Calculate the length of paragraphs in terms of word count
+df['length'] = df['paragraph'].map(lambda x: len(x.split()))
+
+# Plot the histogram
+plt.figure(figsize=(5, 3))
+plt.hist(df['length'].to_numpy(), bins=[0, 50, 100, 200, 300, 500, 1000])
+plt.title("Word count distribution")
+plt.xlabel("Number of Words")
+plt.ylabel("Frequency")
+
+# Show the plot
+plt.show()
+from transformers import AutoTokenizer
+
+# Initialize the tokenizer
+tokenizer = AutoTokenizer.from_pretrained("allenai/led-base-16384")
+def process_data_to_model_inputs(batch):
+    # Tokenize the inputs and labels
+    inputs = tokenizer(
+        batch["paragraph"],
+        padding="max_length",
+        truncation=True,
+        max_length=max_input_length
+    )
+
+    outputs = tokenizer(
+        batch["heading"],
+        padding="max_length",
+        truncation=True,
+        max_length=max_output_length
+    )
+
+    # Add tokenized inputs and attention masks to the batch
+    batch["input_ids"] = inputs.input_ids
+    batch["attention_mask"] = inputs.attention_mask
+
+    # Create global attention mask
+    batch["global_attention_mask"] = [[1] + [0] * (len(batch["input_ids"][0]) - 1) for _ in range(len(batch["input_ids"]))]
+
+    # Add tokenized outputs to the batch
+    batch["labels"] = outputs.input_ids
+
+    # Make sure that the PAD token is ignored
+    pad_token_id = tokenizer.pad_token_id
+    batch["labels"] = [
+        [-100 if token == pad_token_id else token for token in labels]
+        for labels in batch["labels"]
+    ]
+
+    return batch
+import numpy as np
+import pandas as pd
+
+# Sample DataFrame (assuming `df` is your DataFrame)
+# df = pd.read_csv('your_file.csv')  # Load your DataFrame if not already loaded
+
+# Shuffle the DataFrame and split into train, validate, and test sets
+train, validate, test = np.split(
+    df.sample(frac=1, random_state=42),
+    [int(0.6 * len(df)), int(0.8 * len(df))]
+)
+
+# Print shapes of the splits
+print("Train shape:", train.shape)
+print("Validate shape:", validate.shape)
+print("Test shape:", test.shape)
+from datasets import Dataset
+from transformers import AutoTokenizer
+
+# Define constants
+max_input_length = 1074  # Set as per your needs
+max_output_length = 64    # Set as per your needs
+batch_size = 16           # Adjust as necessary
+
+# Initialize tokenizer
+tokenizer = AutoTokenizer.from_pretrained("allenai/led-base-16384")
+
+# Define the data processing function
+def process_data_to_model_inputs(batch):
+    # Tokenize the inputs
+    inputs = tokenizer(
+        batch["paragraph"],
+        padding="max_length",
+        truncation=True,
+        max_length=max_input_length
+    )
+
+    # Tokenize the outputs
+    outputs = tokenizer(
+        batch["heading"],
+        padding="max_length",
+        truncation=True,
+        max_length=max_output_length
+    )
+
+    # Assign inputs and attention masks
+    batch["input_ids"] = inputs.input_ids
+    batch["attention_mask"] = inputs.attention_mask
+
+    # Create global attention masks
+    batch["global_attention_mask"] = [
+        [1 if i == 0 else 0 for i in range(len(batch["input_ids"][0]))]
+        for _ in batch["input_ids"]
+    ]
+
+    # Assign output labels, ensuring PAD tokens are ignored
+    batch["labels"] = [
+        [-100 if token == tokenizer.pad_token_id else token for token in labels]
+        for labels in outputs.input_ids
+    ]
+
+    return batch
+
+# Convert pandas DataFrames to Hugging Face Datasets
+train_dataset = Dataset.from_pandas(train)
+val_dataset = Dataset.from_pandas(validate)
+
+# Map the data processing function to the datasets
+train_dataset = train_dataset.map(
+    process_data_to_model_inputs,
+    batched=True,
+    batch_size=batch_size,
+    remove_columns=["title", "heading", "paragraph", "length", "__index_level_0__"]
+)
+
+val_dataset = val_dataset.map(
+    process_data_to_model_inputs,
+    batched=True,
+    batch_size=batch_size,
+    remove_columns=["title", "heading", "paragraph", "length", "__index_level_0__"]
+)
+
+# Set the format for PyTorch
+train_dataset.set_format(
+    type="torch",
+    columns=["input_ids", "attention_mask", "global_attention_mask", "labels"]
+)
+
+val_dataset.set_format(
+    type="torch",
+    columns=["input_ids", "attention_mask", "global_attention_mask", "labels"]
+)
+
+# Print the shape of the validation dataset
+print(validate.shape)
+from transformers import AutoModelForSeq2SeqLM, Seq2SeqTrainer, Seq2SeqTrainingArguments
+from transformers import AutoTokenizer
+from datasets import load_metric
+import transformers
+
+# Load the model
+led = AutoModelForSeq2SeqLM.from_pretrained(
+    "allenai/led-base-16384",
+    gradient_checkpointing=True,
+    use_cache=False
+)
+
+# Configure the model
+led.config.num_beams = 2
+led.config.max_length = 64
+led.config.min_length = 2
+led.config.length_penalty = 2.0
+led.config.no_repeat_ngram_size = 3
+led.config.early_stopping = True
+
+# Load Rouge metric for evaluation
+rouge = load_metric("rouge")
+
+# Define a function to compute metrics
+def compute_metrics(pred):
+    labels_ids = pred.label_ids
+    pred_ids = pred.predictions
+
+    # Replace -100 with pad_token_id so the tokenizer ignores padding
+    labels_ids[labels_ids == -100] = tokenizer.pad_token_id
+
+    # Decode predictions and references (labels) from IDs to strings
+    pred_str = tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
+    label_str = tokenizer.batch_decode(labels_ids, skip_special_tokens=True)
+
+    # Compute Rouge-2 score
+    rouge_output = rouge.compute(
+        predictions=pred_str,
+        references=label_str,
+        rouge_types=["rouge2"]
+    )["rouge2"].mid
+
+    return {
+        "rouge2_precision": round(rouge_output.precision, 4),
+        "rouge2_recall": round(rouge_output.recall, 4),
+        "rouge2_fmeasure": round(rouge_output.fmeasure, 4)
+    }
+
+# Setup training arguments
+training_args = Seq2SeqTrainingArguments(
+    predict_with_generate=True,
+    evaluation_strategy="steps",
+    per_device_train_batch_size=batch_size,  # Assuming you already defined batch_size
+    per_device_eval_batch_size=batch_size,
+    output_dir="./results",
+    logging_steps=5,
+    eval_steps=10,
+    save_steps=10,
+    save_total_limit=2,
+    gradient_accumulation_steps=4,
+    num_train_epochs=10
+)
+
+# Set logging verbosity
+transformers.logging.set_verbosity_info()
+import pandas as pd
+import numpy as np
+from datasets import Dataset
+
+# Load your data
+df = pd.read_csv("/content/drive/MyDrive/codecycle/wikiHow.csv")
+
+# Preprocess the dataset, drop NA values, and remove duplicates
+df = df.dropna()
+df = df.drop_duplicates()
+
+# Split the dataset
+train_df, val_df = np.split(df.sample(frac=1, random_state=42), [int(.6 * len(df))])
+
+# Convert to Hugging Face Dataset format
+train_dataset = Dataset.from_pandas(train_df)
+val_dataset = Dataset.from_pandas(val_df)
+from transformers import AutoModelForSeq2SeqLM, Seq2SeqTrainer, Seq2SeqTrainingArguments, load_metric
+from transformers import AutoTokenizer
+
+# Load model and tokenizer
+model_name = "allenai/led-base-16384"
+model = AutoModelForSeq2SeqLM.from_pretrained(model_name, gradient_checkpointing=True, use_cache=False)
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+# Configure model parameters
+model.config.num_beams = 2
+model.config.max_length = 64
+model.config.min_length = 2
+model.config.length_penalty = 2.0
+model.config.early_stopping = True
+model.config.no_repeat_ngram_size = 3
+
+# Load metric
+rouge = load_metric("rouge")
+
+def compute_metrics(pred):
+    pred_ids = pred.predictions
+    pred_str = tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
+    
+    labels_ids = pred.label_ids
+    labels_ids[labels_ids == -100] = tokenizer.pad_token_id
+    label_str = tokenizer.batch_decode(labels_ids, skip_special_tokens=True)
+    
+    rouge_output = rouge.compute(predictions=pred_str, references=label_str, rouge_types=["rouge2"])["rouge2"]
+    
+    return {
+        "rouge2 precision": round(rouge_output.precision, 4),
+        "rouge2 recall": round(rouge_output.recall, 4),
+        "rouge2 fmeasure": round(rouge_output.fmeasure, 4),
+    }
+
+# Setup training arguments
+training_args = Seq2SeqTrainingArguments(
+    predict_with_generate=True,
+    evaluation_strategy="steps",
+    per_device_train_batch_size=4,  # Set batch size
+    per_device_eval_batch_size=4,   # Set batch size
+    logging_steps=5,
+    eval_steps=10,
+    save_steps=10,
+    save_total_limit=2,
+    gradient_accumulation_steps=4,
+    num_train_epochs=30,
+)
+
+# Initialize trainer
+trainer = Seq2SeqTrainer(
+    model=model,
+    args=training_args,
+    compute_metrics=compute_metrics,
+    train_dataset = train_dataset,
+    eval_dataset = val_dataset,
+    # Add additional arguments if necessary (e.g., train_dataset, eval_dataset)
+)
+from datasets import load metric
+
+import torch
+
+from datasets import load_dataset, load_metric
+
+from transformers import LEDTokenizer, LEDForConditionalGeneration
+
+#load tokenizer
+
+tokenizer LEDTokenizer.from_pretrained("/content/checkpoint-130")
+
+model = LEDForConditional Generation.from_pretrained("/content/checkpoint-130").to("cuda").half()
+
+def generate_answer(batch):
+
+inputs dict tokenizer(batch["paragraph"], padding="max_length", max_length=512, return_tensors="pt", truncation=True)
+
+input_ids inputs_dict.input_ids.to("cuda")
+
+attention_mask = inputs_dict.attention_mask.to("cuda")
+
+global_attention_mask torch.zeros_like(attention_mask)
+
+#put global attention on token
+
+# global_attention_mask[:, 0] = 1
+
+predicted_abstract_ids model.generate(input_ids, attention_mask attention_mask, global_attention_mask-global_attention_mask) batch["generated_heading"] = tokenizer.batch_decode(predicted_abstract_ids, skip_special_tokens=True) return batch
+
+result = df_test.map(generate_answer, batched=True, batch_size=2)
+result["generated_heading]
